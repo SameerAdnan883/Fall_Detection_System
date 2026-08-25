@@ -2,6 +2,9 @@ import streamlit as st
 import joblib
 import subprocess
 import platform
+from streamlit_webrtc import webrtc_streamer
+import base64
+import web_detector 
 
 
 # ============================================
@@ -355,6 +358,77 @@ div[data-testid="stAlert"] {
 
 </style>
 """, unsafe_allow_html=True)
+
+
+from web_detector import FallDetectionProcessor
+
+st.markdown("""
+<style>
+.camera-container {
+    max-width: 800px;
+    margin: auto;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+webrtc_streamer(
+    key="fall-detection-camera",
+
+    video_processor_factory=FallDetectionProcessor,
+
+    media_stream_constraints={
+        "video": {
+            "width": {"ideal": 800},
+            "height": {"ideal": 600}
+        },
+        "audio": False
+    },
+
+    async_processing=True,
+)
+
+
+# ============================================
+# FALL ALARM — PLAY ONCE PER FALL
+# ============================================
+
+if "alarm_played" not in st.session_state:
+    st.session_state.alarm_played = False
+
+
+@st.fragment(run_every="1s")
+def fall_alarm():
+
+    # New fall detected
+    if web_detector.FALL_DETECTED:
+
+        if not st.session_state.alarm_played:
+
+            with open(
+                "sounds/adhi_adhi_raat_meme.mp3",
+                "rb"
+            ) as f:
+
+                audio_bytes = f.read()
+
+            st.audio(
+                audio_bytes,
+                format="audio/mp3",
+                autoplay=True
+            )
+
+            st.session_state.alarm_played = True
+
+    # Fall is over → reset
+    else:
+
+        st.session_state.alarm_played = False
+
+
+fall_alarm()
+
+
 
 # ============================================
 # HOW IT WORKS
