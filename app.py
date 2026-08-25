@@ -240,19 +240,45 @@ with col2:
         use_container_width=True
     )
 
-if start:
-    subprocess.Popen(
-        ["python", "10_live_prediction.py"]
-    )
 
-    st.success("🟢 Live fall detection started!")
+
+if start:
+
+    if platform.system() == "Darwin":
+
+        subprocess.Popen(
+            ["python", "10_live_prediction.py"]
+        )
+
+        st.success(
+            "🟢 Live fall detection started!"
+        )
+
+    else:
+
+        st.info(
+            "🌐 Live camera detection is available "
+            "when running locally."
+        )
+
 
 if stop:
-    subprocess.run(
-        ["pkill", "-f", "10_live_prediction.py"]
-    )
 
-    st.warning("🛑 Live fall detection stopped.")
+    if platform.system() == "Darwin":
+
+        subprocess.run(
+            ["pkill", "-f", "10_live_prediction.py"]
+        )
+
+        st.warning(
+            "🛑 Live fall detection stopped."
+        )
+
+    else:
+
+        st.info(
+            "🌐 Cloud mode does not control a local camera process."
+        )
 
 st.markdown("""
 <style>
