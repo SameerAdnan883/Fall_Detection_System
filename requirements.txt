@@ -7,3 +7,4 @@ streamlit==1.62.0
 pandas==3.0.5
 scipy==1.17.1
 pillow==12.3.0
+streamlit-webrtc
