@@ -1,6 +1,7 @@
 import streamlit as st
 import joblib
 import subprocess
+import platform
 
 # ============================================
 # WELCOME VOICE
@@ -8,11 +9,12 @@ import subprocess
 
 if "welcome_spoken" not in st.session_state:
 
-    subprocess.Popen([
-        "say",
-        "-v", "Zarvox",
-        "Welcome to Fall Detection System, developed by Sameer."
-    ])
+    if platform.system() == "Darwin":
+
+        subprocess.Popen([
+            "say",
+            "Welcome to Fall Detection System, developed by Sameer."
+        ])
 
     st.session_state.welcome_spoken = True
 # ============================================
