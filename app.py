@@ -3,20 +3,7 @@ import joblib
 import subprocess
 import platform
 
-# ============================================
-# WELCOME VOICE
-# ============================================
 
-if "welcome_spoken" not in st.session_state:
-
-    if platform.system() == "Darwin":
-
-        subprocess.Popen([
-            "say",
-            "Welcome to Fall Detection System, developed by Sameer."
-        ])
-
-    st.session_state.welcome_spoken = True
 # ============================================
 # PAGE CONFIG
 # ============================================
