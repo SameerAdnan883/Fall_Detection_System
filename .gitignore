@@ -1,0 +1,18 @@
+# Virtual environment
+.venv311/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local Streamlit
+.streamlit/secrets.toml
+
+# Raw dataset
+dataset/raw/
