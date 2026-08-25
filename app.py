@@ -1,8 +1,8 @@
 import streamlit as st
 import joblib
-import subprocess
 import platform
-
+import subprocess
+import sys
 import base64
 from streamlit_webrtc import webrtc_streamer
 
@@ -221,62 +221,45 @@ for col, (icon, name) in zip(cols, steps):
         )
 
 # ============================================
-# LIVE DETECTION CONTROL
+# LIVE FALL DETECTION
 # ============================================
 
 st.subheader("🎥 Live Detection")
 
-st.markdown("## 🎥 Live Fall Detection")
-
-webrtc_streamer(
-    key="fall_detection",
-    video_processor_factory=web_detector.FallDetectionProcessor,
-    media_stream_constraints={
-        "video": True,
-        "audio": False
-    },
-    async_processing=True
-)
-
 col1, col2 = st.columns(2)
 
 with col1:
+
     start = st.button(
         "▶️ Start Fall Detection",
         use_container_width=True
     )
 
 with col2:
+
     stop = st.button(
         "⏹️ Stop Fall Detection",
         use_container_width=True
     )
 
 
+# ============================================
+# MAC / LOCAL MODE
+# ============================================
 
-if start:
+if platform.system() == "Darwin":
 
-    if platform.system() == "Darwin":
+    if start:
 
         subprocess.Popen(
-            ["python", "10_live_prediction.py"]
+            [sys.executable, "10_live_prediction.py"]
         )
 
         st.success(
             "🟢 Live fall detection started!"
         )
 
-    else:
-
-        st.info(
-            "🌐 Live camera detection is available "
-            "when running locally."
-        )
-
-
-if stop:
-
-    if platform.system() == "Darwin":
+    if stop:
 
         subprocess.run(
             ["pkill", "-f", "10_live_prediction.py"]
@@ -286,11 +269,64 @@ if stop:
             "🛑 Live fall detection stopped."
         )
 
-    else:
 
-        st.info(
-            "🌐 Cloud mode does not control a local camera process."
-        )
+# ============================================
+# CLOUD / BROWSER MODE
+# ============================================
+
+else:
+
+    if "fall_detection_running" not in st.session_state:
+
+        st.session_state.fall_detection_running = False
+
+
+    if start:
+
+        st.session_state.fall_detection_running = True
+        st.rerun()
+
+
+    if stop:
+
+        st.session_state.fall_detection_running = False
+        st.rerun()
+
+
+    st.markdown("### 🎥 Browser Camera")
+
+
+    webrtc_streamer(
+        key="fall_detection",
+
+        video_processor_factory=web_detector.FallDetectionProcessor,
+
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 1920},
+                "height": {"ideal": 1080},
+                "frameRate": {"ideal": 30}
+            },
+            "audio": False
+        },
+
+        desired_playing_state=st.session_state.get(
+            "fall_detection_running",
+            False
+        ),
+
+        async_processing=True,
+
+        rtc_configuration={
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302"
+                    ]
+                }
+            ]
+        }
+    )
 
 st.markdown("""
 <style>
