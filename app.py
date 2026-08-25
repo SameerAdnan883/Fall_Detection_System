@@ -4,7 +4,9 @@ import subprocess
 import platform
 
 import base64
+from streamlit_webrtc import webrtc_streamer
 
+import web_detector
 
 
 # ============================================
@@ -224,9 +226,16 @@ for col, (icon, name) in zip(cols, steps):
 
 st.subheader("🎥 Live Detection")
 
-st.info(
-    "The live detector uses MediaPipe Pose + Random Forest "
-    "to detect falls from your camera."
+st.markdown("## 🎥 Live Fall Detection")
+
+webrtc_streamer(
+    key="fall_detection",
+    video_processor_factory=web_detector.FallDetectionProcessor,
+    media_stream_constraints={
+        "video": True,
+        "audio": False
+    },
+    async_processing=True
 )
 
 col1, col2 = st.columns(2)
