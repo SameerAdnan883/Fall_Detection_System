@@ -122,23 +122,27 @@ def create_features(landmarks):
 # ============================================
 
 def is_full_body_visible(landmarks):
-
+    """
+    Fall-aware visibility check: anchors on core torso landmarks (nose, shoulders, hips)
+    while tolerating occluded knees or ankles during floor falls.
+    """
+    core_landmarks = [
+        0,          # Nose
+        11, 12,     # Shoulders
+        23, 24      # Hips
+    ]
     required_landmarks = [
-        0,
-        11, 12,
-        23, 24,
-        25, 26,
-        27, 28
+        0,          # Nose
+        11, 12,     # Shoulders
+        23, 24,     # Hips
+        25, 26,     # Knees
+        27, 28      # Ankles
     ]
 
-    visible_count = 0
+    core_visible = sum(1 for index in core_landmarks if landmarks[index].visibility >= 0.50)
+    total_visible = sum(1 for index in required_landmarks if landmarks[index].visibility >= 0.50)
 
-    for index in required_landmarks:
-
-        if landmarks[index].visibility >= 0.6:
-            visible_count += 1
-
-    return visible_count >= 8
+    return (core_visible >= 4) and (total_visible >= 6)
 
 
 # ============================================
@@ -146,23 +150,32 @@ def is_full_body_visible(landmarks):
 # ============================================
 
 def is_fall_posture(landmarks):
-
+    """
+    Multi-directional posture validation: uses the biomechanical spine vector
+    (mid-shoulder to mid-hip) with fallback to nose-to-hip, plus a strict
+    floor-collapse foreshortening check for forward/backward falls.
+    """
     x = np.array([p.x for p in landmarks])
     y = np.array([p.y for p in landmarks])
 
-    body_angle = np.degrees(
-        np.arctan2(
-            y[24] - y[0],
-            x[24] - x[0]
-        )
-    )
+    sh_x = (x[11] + x[12]) / 2.0
+    sh_y = (y[11] + y[12]) / 2.0
+    hip_x = (x[23] + x[24]) / 2.0
+    hip_y = (y[23] + y[24]) / 2.0
 
-    horizontal_angle = min(
-        abs(body_angle),
-        abs(abs(body_angle) - 180)
-    )
+    dx = hip_x - sh_x
+    dy = hip_y - sh_y
+    torso_angle = np.degrees(np.arctan2(dy, dx))
+    horizontal_angle = min(abs(torso_angle), abs(abs(torso_angle) - 180))
 
-    return horizontal_angle <= 45
+    # Fallback nose-to-right-hip angle
+    orig_angle = np.degrees(np.arctan2(y[24] - y[0], x[24] - x[0]))
+    orig_horizontal_angle = min(abs(orig_angle), abs(abs(orig_angle) - 180))
+
+    # Strict forward/backward floor-collapse check: shoulders, hips, and head all at floor elevation
+    strict_fw_bw = (min(sh_y, hip_y) > 0.65) and (abs(dy) < 0.12) and (y[0] > 0.60)
+
+    return (horizontal_angle <= 55) or (orig_horizontal_angle <= 55) or strict_fw_bw
 
 
 # ============================================
