@@ -138,6 +138,69 @@ feature_names = saved["feature_names"]
 
 
 # ============================================
+# WEBRTC ICE SERVER CONFIGURATION (STUN / TURN)
+# ============================================
+
+def get_ice_servers():
+    """
+    Builds the WebRTC ICE servers configuration.
+    Preserves public Google STUN and dynamically attaches secure dedicated TURN/TURNS
+    credentials from Streamlit Secrets (st.secrets["turn"] or st.secrets["ice_servers"])
+    to enable cloud firewall and symmetric NAT traversal on Streamlit Community Cloud.
+    Uses exact URLs supplied by the user/dashboard without altering schemes or assuming ports.
+    """
+    ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}
+    ]
+    turn_configured = False
+    try:
+        if hasattr(st, "secrets"):
+            # Option 1: Configured via [turn] table in secrets.toml
+            if "turn" in st.secrets:
+                turn_sec = st.secrets["turn"]
+                raw_urls = turn_sec.get("urls") or turn_sec.get("url")
+                username = turn_sec.get("username")
+                credential = turn_sec.get("credential") or turn_sec.get("password")
+
+                if raw_urls and username and credential:
+                    if isinstance(raw_urls, str):
+                        turn_urls = [raw_urls.strip()]
+                    elif isinstance(raw_urls, (list, tuple)):
+                        turn_urls = [str(u).strip() for u in raw_urls if str(u).strip()]
+                    else:
+                        turn_urls = []
+
+                    if turn_urls:
+                        ice_servers.append({
+                            "urls": turn_urls,
+                            "username": str(username),
+                            "credential": str(credential),
+                        })
+                        if any(u.startswith(("turn:", "turns:")) for u in turn_urls):
+                            turn_configured = True
+
+            # Option 2: Configured via [[ice_servers]] list of tables in secrets.toml
+            elif "ice_servers" in st.secrets or "iceServers" in st.secrets:
+                raw_servers = st.secrets.get("ice_servers") or st.secrets.get("iceServers")
+                if isinstance(raw_servers, (list, tuple)):
+                    for s in raw_servers:
+                        if isinstance(s, dict) and "urls" in s:
+                            entry = {"urls": s["urls"]}
+                            if s.get("username"):
+                                entry["username"] = str(s["username"])
+                            if s.get("credential") or s.get("password"):
+                                entry["credential"] = str(s.get("credential") or s.get("password"))
+                            ice_servers.append(entry)
+                            urls_list = s["urls"] if isinstance(s["urls"], (list, tuple)) else [s["urls"]]
+                            if any(str(u).startswith(("turn:", "turns:")) for u in urls_list):
+                                turn_configured = True
+    except Exception:
+        pass
+
+    return ice_servers, turn_configured
+
+
+# ============================================
 # BROWSER AUDIO ENGINE & UNLOCKER
 # ============================================
 
@@ -494,6 +557,18 @@ if camera_mode.startswith("🌐 Browser Camera"):
             st.session_state.browser_stream_running = False
             st.rerun()
 
+    ice_servers, turn_configured = get_ice_servers()
+
+    if not turn_configured:
+        st.warning(
+            "⚠️ **TURN Server Not Configured:** Remote cloud deployments on Streamlit Community Cloud "
+            "require a dedicated TURN server to stream camera video across cloud firewalls and symmetric NATs. "
+            "If your camera preview keeps loading without video, add your TURN credentials to "
+            "Streamlit Cloud **App Settings → Secrets** (see setup guide below)."
+        )
+    else:
+        st.caption("🔒 **TURN Relay Active:** Media stream configured for cloud NAT/firewall traversal.")
+
     webrtc_ctx = webrtc_streamer(
         key="fall_detection_adaptive",
         video_processor_factory=web_detector.FallDetectionProcessor,
@@ -507,13 +582,7 @@ if camera_mode.startswith("🌐 Browser Camera"):
         ),
         async_processing=True,
         rtc_configuration={
-            "iceServers": [
-                {
-                    "urls": [
-                        "stun:stun.l.google.com:19302"
-                    ]
-                }
-            ]
+            "iceServers": ice_servers
         }
     )
 
@@ -529,6 +598,30 @@ if camera_mode.startswith("🌐 Browser Camera"):
           - Alternatively, connect via an HTTPS tunnel (e.g. Cloudflare Tunnel, ngrok, or Streamlit Cloud).
         - **Front vs Rear Camera:** Use the selector above to switch between selfie mode and room-monitoring mode.
         - **Camera In Use Error:** If the camera fails to start, ensure no other application (Zoom, FaceTime, Teams) is locking the camera hardware.
+
+        ---
+        #### 🌐 Streamlit Community Cloud TURN Server Configuration
+        Streamlit Community Cloud containers block direct inbound UDP traffic. To stream live video from your browser to Streamlit Cloud, configure TURN credentials in **Streamlit Cloud Dashboard → Manage App → App Settings → Secrets**:
+        ```toml
+        [turn]
+        urls = [
+            "turn:<your-metered-domain>:80",
+            "turn:<your-metered-domain>:80?transport=tcp",
+            "turn:<your-metered-domain>:443",
+            "turns:<your-metered-domain>:443",
+            "turns:<your-metered-domain>:443?transport=tcp"
+        ]
+        username = "<your-metered-username>"
+        credential = "<your-metered-credential>"
+        ```
+        *Or with a single TURNS (TURN over TLS) endpoint:*
+        ```toml
+        [turn]
+        url = "turns:<your-metered-domain>:443?transport=tcp"
+        username = "<your-metered-username>"
+        credential = "<your-metered-credential>"
+        ```
+        *(Copy the exact ICE server URLs, username, and credential directly from your Metered.ca dashboard under ICE Servers).*
         """)
 
 
