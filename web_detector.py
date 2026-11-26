@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import joblib
 import mediapipe as mp
 import time
@@ -28,19 +29,24 @@ feature_names = saved["feature_names"]
 # MEDIAPIPE
 # ============================================
 
-base_options = python.BaseOptions(
-    model_asset_path="models/pose_landmarker_lite.task"
-)
+def create_landmarker():
+    base_options = python.BaseOptions(
+        model_asset_path="models/pose_landmarker_lite.task"
+    )
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=1
+    )
+    return vision.PoseLandmarker.create_from_options(options)
 
-options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    running_mode=vision.RunningMode.VIDEO,
-    num_poses=1
-)
+_global_landmarker = None
 
-landmarker = vision.PoseLandmarker.create_from_options(
-    options
-)
+def get_landmarker():
+    global _global_landmarker
+    if _global_landmarker is None:
+        _global_landmarker = create_landmarker()
+    return _global_landmarker
 
 
 # ============================================
@@ -166,34 +172,21 @@ def is_fall_posture(landmarks):
 def predict_fall(landmarks):
 
     if not is_full_body_visible(landmarks):
-
         return "BODY NOT FULLY VISIBLE", 0.0
 
-    features = create_features(
-        landmarks
-    )
+    features = create_features(landmarks)
+    features_df = pd.DataFrame(features, columns=feature_names)
+    features_imp = imputer.transform(features_df)
+    features_scl = scaler.transform(features_imp)
 
-    features = imputer.transform(
-        features
-    )
-
-    features = scaler.transform(
-        features
-    )
-
-    probability = model.predict_proba(
-        features
-    )[0][1]
+    probability = float(model.predict_proba(features_scl)[0][1])
 
     if (
         probability >= 0.5
         and is_fall_posture(landmarks)
     ):
-
         label = "FALL"
-
     else:
-
         label = "NORMAL"
 
     return label, probability
@@ -211,16 +204,43 @@ from streamlit_webrtc import VideoProcessorBase
 class FallDetectionProcessor(VideoProcessorBase):
 
     def __init__(self):
-
         self.timestamp_ms = 0
+        self.last_timestamp_ms = -1
         self.fall_count = 0
         self.fall_detected = False
-        self.fall_detected_until=0
+
+        # Alarm state machine: "normal", "active", "silenced", "recovery"
+        self.alarm_state = "normal"
+        self.last_fall_time = 0.0
+        self.recovery_duration = 3.0  # seconds in normal posture required to rearm
 
         self.FALL_THRESHOLD = 0.5
         self.REQUIRED_FRAMES = 12
         self.POSSIBLE_FALL_FRAMES = 4
 
+        # Per-instance landmarker prevents multi-session and restart timestamp collisions
+        self.landmarker = create_landmarker()
+
+    def silence_alarm(self):
+        """Immediately mutes the active alarm."""
+        self.alarm_state = "silenced"
+
+    def reset_alarm(self):
+        """Manual reset to normal armed state."""
+        self.alarm_state = "normal"
+        self.fall_detected = False
+        self.fall_count = 0
+
+    def close(self):
+        if hasattr(self, "landmarker") and self.landmarker is not None:
+            try:
+                self.landmarker.close()
+            except Exception:
+                pass
+            self.landmarker = None
+
+    def __del__(self):
+        self.close()
 
     def recv(self, frame):
         global FALL_DETECTED
@@ -232,16 +252,32 @@ class FallDetectionProcessor(VideoProcessorBase):
             cv2.COLOR_BGR2RGB
         )
 
+        h, w, _ = image.shape
+
+        # Adaptive inference scaling:
+        # If camera resolution is high (> 1280px width), resize a separate copy for MediaPipe inference.
+        # Original full-resolution image is preserved for display.
+        if w > 1280:
+            proc_w = 1280
+            proc_h = int(h * (1280.0 / w))
+            proc_rgb = cv2.resize(rgb, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            proc_rgb = rgb
+
         mp_image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
-            data=rgb
+            data=proc_rgb
         )
 
-        self.timestamp_ms += 33
+        # Monotonically increasing timestamp based on frame arrival time
+        current_time_ms = int(time.time() * 1000)
+        if current_time_ms <= self.last_timestamp_ms:
+            current_time_ms = self.last_timestamp_ms + 33
+        self.last_timestamp_ms = current_time_ms
 
-        result = landmarker.detect_for_video(
+        result = self.landmarker.detect_for_video(
             mp_image,
-            self.timestamp_ms
+            current_time_ms
         )
 
         label = "NO PERSON"
@@ -252,35 +288,73 @@ class FallDetectionProcessor(VideoProcessorBase):
         # ====================================
 
         if result.pose_landmarks:
-
             landmarks = result.pose_landmarks[0]
 
             if is_full_body_visible(landmarks):
-
-                # Create exactly the same 138 features
+                # Exact 138-feature calculation
                 features = create_features(landmarks)
+                features_df = pd.DataFrame(features, columns=feature_names)
+                features_imp = imputer.transform(features_df)
+                features_scl = scaler.transform(features_imp)
 
-                features = imputer.transform(features)
-                features = scaler.transform(features)
-
-                probability = model.predict_proba(features)[0][1]
-
-
-
-                # Check posture separately
+                probability = float(model.predict_proba(features_scl)[0][1])
                 posture_ok = is_fall_posture(landmarks)
 
-                # Same logic as your Mac detector
-                if (
-                    probability >= self.FALL_THRESHOLD
-                    and posture_ok
-                ):
-
+                # Anti-jitter confirmation: decay gently instead of instant zeroing
+                if probability >= self.FALL_THRESHOLD and posture_ok:
                     self.fall_count += 1
+                else:
+                    self.fall_count = max(0, self.fall_count - 2)
+
+                # ====================================
+                # FALL STATUS & ALARM STATE MACHINE
+                # ====================================
+                now = time.time()
+
+                if self.fall_count >= self.REQUIRED_FRAMES:
+                    self.last_fall_time = now
+                    self.fall_detected = True
+                    FALL_DETECTED = True
+
+                    if self.alarm_state != "silenced":
+                        self.alarm_state = "active"
+                        label = "FALL DETECTED!"
+                    else:
+                        label = "FALL DETECTED (MUTED)"
+
+                elif self.fall_count >= self.POSSIBLE_FALL_FRAMES:
+                    if self.alarm_state == "active":
+                        label = "FALL DETECTED!"
+                        self.fall_detected = True
+                        FALL_DETECTED = True
+                    elif self.alarm_state == "silenced":
+                        label = "FALL DETECTED (MUTED)"
+                        self.fall_detected = True
+                    else:
+                        label = "POSSIBLE FALL"
+                        self.fall_detected = False
+                        FALL_DETECTED = False
 
                 else:
-
-                    self.fall_count = 0
+                    # Normal posture: check for recovery & re-arming
+                    if self.alarm_state in ["active", "silenced"]:
+                        if now - self.last_fall_time >= self.recovery_duration:
+                            self.alarm_state = "normal"
+                            self.fall_detected = False
+                            FALL_DETECTED = False
+                            label = "NORMAL (REARMED)"
+                        else:
+                            if self.alarm_state == "active":
+                                label = "FALL DETECTED!"
+                                self.fall_detected = True
+                                FALL_DETECTED = True
+                            else:
+                                label = "FALL DETECTED (MUTED)"
+                                self.fall_detected = True
+                    else:
+                        label = "NORMAL"
+                        self.fall_detected = False
+                        FALL_DETECTED = False
 
                 cv2.putText(
                     image,
@@ -294,7 +368,7 @@ class FallDetectionProcessor(VideoProcessorBase):
 
                 cv2.putText(
                     image,
-                    f"Fall Frames: {self.fall_count}/12",
+                    f"Fall Frames: {self.fall_count}/{self.REQUIRED_FRAMES}",
                     (30, 125),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -302,69 +376,48 @@ class FallDetectionProcessor(VideoProcessorBase):
                     2
                 )
 
-                # Same confirmation rules
-                if self.fall_count >= self.REQUIRED_FRAMES:
+            else:
+                # Body not sufficiently visible
+                now = time.time()
+                self.fall_count = max(0, self.fall_count - 1)
 
-                    label = "FALL DETECTED!"
-                    self.fall_detected = True
-                    
-                    FALL_DETECTED = True
-                    self.fall_detected_until = time.time() + 5  # Reset after 5 seconds
-
-                elif self.fall_count >= self.POSSIBLE_FALL_FRAMES:
-
-                    label = "POSSIBLE FALL"
-                    self.fall_detected = False
-                    FALL_DETECTED = False
-
-                else:
-
-                    label = "NORMAL"
-                    self.fall_detected = False
-                    FALL_DETECTED = False
-                    # ====================================
-                    # KEEP FALL DETECTED ACTIVE
-                    # ====================================
-
-                    if time.time() < self.fall_detected_until:
-
-                        label = "FALL DETECTED!"
-                        self.fall_detected = True
-                        FALL_DETECTED = True
-
-                    else:
-
+                if self.alarm_state in ["active", "silenced"]:
+                    if now - self.last_fall_time >= self.recovery_duration:
+                        self.alarm_state = "normal"
                         self.fall_detected = False
                         FALL_DETECTED = False
+                        label = "BODY NOT FULLY VISIBLE"
+                        probability = 0.0
+                    else:
+                        if self.alarm_state == "active":
+                            label = "FALL DETECTED!"
+                            self.fall_detected = True
+                            FALL_DETECTED = True
+                        else:
+                            label = "FALL DETECTED (MUTED)"
+                            self.fall_detected = True
+                else:
+                    label = "BODY NOT FULLY VISIBLE"
+                    self.fall_detected = False
+                    FALL_DETECTED = False
+                    probability = 0.0
 
-                    # ====================================
-                    # DRAW POSE LANDMARKS
-                    # ====================================
+            # ====================================
+            # DRAW POSE LANDMARKS (Drawn for all detected persons)
+            # ====================================
 
-                    h, w, _ = image.shape
-
-                    for landmark in landmarks:
-
-                        cx = int(landmark.x * w)
-                        cy = int(landmark.y * h)
-
-                        if 0 <= cx < w and 0 <= cy < h:
-
-                            cv2.circle(
-                                image,
-                                (cx, cy),
-                                4,
-                                (0, 255, 0),
-                                -1
-                            )
-
-            else:
-
-                label = "BODY NOT FULLY VISIBLE"
-                self.fall_detected = False
-                FALL_DETECTED = False
-                probability = 0.0
-                self.fall_count = 0
+            h, w, _ = image.shape
+            for landmark in landmarks:
+                cx = int(landmark.x * w)
+                cy = int(landmark.y * h)
+                if 0 <= cx < w and 0 <= cy < h:
+                    cv2.circle(
+                        image,
+                        (cx, cy),
+                        4,
+                        (0, 0, 255) if ("FALL" in label) else (0, 255, 0),
+                        -1
+                    )
 
         # ====================================
         # DISPLAY

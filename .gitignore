@@ -16,3 +16,10 @@ __pycache__/
 
 # Raw dataset
 dataset/raw/
+
+# Backups and temporary files
+*.bak
+*.phase*_bak
+*_backup.py
+*_before_hybrid.py
+static/

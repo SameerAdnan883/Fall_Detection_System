@@ -3,10 +3,44 @@ import joblib
 import platform
 import subprocess
 import sys
+import os
 import base64
+import psutil
+import streamlit.components.v1 as components
 from streamlit_webrtc import webrtc_streamer
 
 import web_detector
+
+def get_desktop_detector_pid():
+    """Returns the PID of a running 10_live_prediction.py process, or None."""
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            cmd = proc.info.get('cmdline') or []
+            if any("10_live_prediction.py" in arg for arg in cmd):
+                return proc.info['pid']
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return None
+
+def stop_desktop_detector():
+    """Gracefully terminates 10_live_prediction.py and all child audio/subprocesses."""
+    pid = get_desktop_detector_pid()
+    if pid:
+        try:
+            parent = psutil.Process(pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.terminate()
+            gone, alive = psutil.wait_procs([parent], timeout=2.0)
+            for p in alive:
+                p.kill()
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
 
 
 # ============================================
@@ -68,6 +102,23 @@ st.markdown("""
 }
 
 </style>
+
+<!-- Audio Interaction Unlocker (Bypasses Browser Autoplay Restrictions on Click/Touch) -->
+<script>
+(function() {
+    function primeBrowserAudio() {
+        try {
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (AudioCtx) {
+                var ctx = new AudioCtx();
+                ctx.resume();
+            }
+        } catch(e) {}
+    }
+    document.addEventListener('click', primeBrowserAudio, { once: true });
+    document.addEventListener('touchstart', primeBrowserAudio, { once: true });
+})();
+</script>
 """, unsafe_allow_html=True)
 
 
@@ -84,6 +135,129 @@ saved = joblib.load(
 
 model = saved["model"]
 feature_names = saved["feature_names"]
+
+
+# ============================================
+# BROWSER AUDIO ENGINE & UNLOCKER
+# ============================================
+
+@st.cache_data
+def get_alarm_audio_b64():
+    audio_path = "sounds/adhi_adhi_raat_meme.mp3"
+    if os.path.exists(audio_path):
+        try:
+            with open(audio_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        except Exception:
+            pass
+    return ""
+
+def render_browser_audio_player(should_play: bool, audio_b64: str):
+    """
+    Renders an embedded client-side audio player in the user's browser DOM.
+    Runs on the client device (Android, iOS, Desktop) and uses Web Audio API fallback.
+    """
+    html_code = f"""
+    <div id="audio-container" style="display:none;">
+        <audio id="fall-alarm-audio" loop preload="auto" src="data:audio/mp3;base64,{audio_b64}"></audio>
+    </div>
+    <script>
+    (function() {{
+        var audio = document.getElementById("fall-alarm-audio");
+        var shouldPlay = {'true' if should_play else 'false'};
+
+        function playSound() {{
+            if (audio && audio.src && audio.src.length > 50) {{
+                var p = audio.play();
+                if (p !== undefined) {{
+                    p.catch(function(err) {{
+                        console.warn("HTML5 audio playback blocked by browser policy, attempting Web Audio synthesizer fallback:", err);
+                        playWebAudioSynth();
+                    }});
+                }}
+            }} else {{
+                playWebAudioSynth();
+            }}
+        }}
+
+        function stopSound() {{
+            if (audio) {{
+                audio.pause();
+                audio.currentTime = 0;
+            }}
+            if (window._synthOsc) {{
+                try {{ window._synthOsc.stop(); }} catch(e) {{}}
+                window._synthOsc = null;
+            }}
+        }}
+
+        function playWebAudioSynth() {{
+            if (window._synthOsc) return;
+            try {{
+                var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!window._audioCtx) {{
+                    window._audioCtx = new AudioCtx();
+                }}
+                if (window._audioCtx.state === 'suspended') {{
+                    window._audioCtx.resume();
+                }}
+                var osc = window._audioCtx.createOscillator();
+                var gain = window._audioCtx.createGain();
+                osc.type = "sawtooth";
+                osc.frequency.setValueAtTime(880, window._audioCtx.currentTime);
+                gain.gain.setValueAtTime(0.3, window._audioCtx.currentTime);
+                osc.connect(gain);
+                gain.connect(window._audioCtx.destination);
+                osc.start();
+                window._synthOsc = osc;
+            }} catch(e) {{
+                console.error("Web Audio fallback error:", e);
+            }}
+        }}
+
+        if (shouldPlay) {{
+            playSound();
+        }} else {{
+            stopSound();
+        }}
+    }})();
+    </script>
+    """
+    components.html(html_code, height=0, width=0)
+
+@st.fragment(run_every="500ms")
+def browser_alarm_panel(webrtc_ctx, audio_b64):
+    if webrtc_ctx and webrtc_ctx.video_processor:
+        proc = webrtc_ctx.video_processor
+        alarm_state = getattr(proc, "alarm_state", "normal")
+        fall_count = getattr(proc, "fall_count", 0)
+
+        should_play = (alarm_state == "active")
+        render_browser_audio_player(should_play=should_play, audio_b64=audio_b64)
+
+        if alarm_state == "active":
+            st.error("🚨 **FALL DETECTED! Alarm is sounding on your device.**")
+            col_a, col_b = st.columns([2, 1])
+            with col_a:
+                st.caption(f"Confirmed fall posture • Counter: {fall_count}/12 frames")
+            with col_b:
+                if st.button("🔕 Silence Alarm", key="silence_btn", use_container_width=True):
+                    proc.silence_alarm()
+                    st.rerun(scope="fragment")
+
+        elif alarm_state == "silenced":
+            st.warning("🔕 **Alarm Silenced** — Sound muted. Waiting for subject recovery to re-arm.")
+            if st.button("🔄 Re-arm Now", key="rearm_btn", use_container_width=True):
+                proc.reset_alarm()
+                st.rerun(scope="fragment")
+
+        elif alarm_state in ["normal", "recovery"]:
+            if fall_count >= 4:
+                st.warning(f"⚠️ **Possible Fall:** {fall_count}/12 frames detected")
+            else:
+                st.info("🟢 **System Armed & Ready** • Monitoring for falls")
+    else:
+        st.caption("ℹ️ Camera stream is starting...")
 
 
 # ============================================
@@ -224,99 +398,114 @@ for col, (icon, name) in zip(cols, steps):
 # LIVE FALL DETECTION
 # ============================================
 
-st.subheader("🎥 Live Detection")
+st.subheader("🎥 Live Fall Detection")
 
-col1, col2 = st.columns(2)
-
-with col1:
-
-    start = st.button(
-        "▶️ Start Fall Detection",
-        use_container_width=True
-    )
-
-with col2:
-
-    stop = st.button(
-        "⏹️ Stop Fall Detection",
-        use_container_width=True
-    )
+camera_mode = st.radio(
+    "Select Camera Access Pipeline:",
+    [
+        "🌐 Browser Camera (Works on Android, iPhone, Windows, Mac)",
+        "🖥️ Local Desktop Camera (Host OpenCV Window)"
+    ],
+    index=0,
+    help="Browser Camera streams from your actual device through WebRTC. Local Desktop Camera runs on the machine hosting Streamlit."
+)
 
 
 # ============================================
-# MAC / LOCAL MODE
+# PIPELINE 1: DEVICE-ADAPTIVE BROWSER CAMERA
 # ============================================
 
-if platform.system() == "Darwin":
+if camera_mode.startswith("🌐 Browser Camera"):
 
-    if start:
+    # Camera Capability & Device Controls
+    cam_col1, cam_col2 = st.columns(2)
 
-        subprocess.Popen(
-            [sys.executable, "10_live_prediction.py"]
+    with cam_col1:
+        facing_option = st.selectbox(
+            "📷 Camera Selection (Mobile / Front & Rear):",
+            [
+                "User / Front Camera",
+                "Environment / Rear Camera"
+            ],
+            index=0,
+            help="Select between Front (selfie) and Rear (room monitoring) camera on Android and mobile devices."
         )
 
-        st.success(
-            "🟢 Live fall detection started!"
+    with cam_col2:
+        quality_option = st.selectbox(
+            "⚙️ Camera Quality / Resolution:",
+            [
+                "Adaptive (Recommended - Best Device Quality)",
+                "Full HD (1080p)",
+                "Standard HD (720p)",
+                "Smooth Performance (480p)"
+            ],
+            index=0,
+            help="Negotiates best supported quality with your camera hardware without forced downscaling."
         )
 
-    if stop:
+    # Dynamic W3C MediaStreamConstraints Negotiation
+    facing_mode_constraint = "user" if facing_option == "User / Front Camera" else {"ideal": "environment"}
 
-        subprocess.run(
-            ["pkill", "-f", "10_live_prediction.py"]
-        )
+    if quality_option == "Full HD (1080p)":
+        video_constraints = {
+            "facingMode": facing_mode_constraint,
+            "width": {"ideal": 1920, "min": 1280},
+            "height": {"ideal": 1080, "min": 720},
+            "frameRate": {"ideal": 30}
+        }
+    elif quality_option == "Standard HD (720p)":
+        video_constraints = {
+            "facingMode": facing_mode_constraint,
+            "width": {"ideal": 1280, "min": 640},
+            "height": {"ideal": 720, "min": 480},
+            "frameRate": {"ideal": 30}
+        }
+    elif quality_option == "Smooth Performance (480p)":
+        video_constraints = {
+            "facingMode": facing_mode_constraint,
+            "width": {"ideal": 640, "min": 320},
+            "height": {"ideal": 480, "min": 240},
+            "frameRate": {"ideal": 30}
+        }
+    else:
+        # Adaptive (Recommended - W3C ideal negotiation for diverse devices)
+        video_constraints = {
+            "facingMode": facing_mode_constraint,
+            "width": {"ideal": 1280, "max": 1920},
+            "height": {"ideal": 720, "max": 1080},
+            "frameRate": {"ideal": 30, "max": 30}
+        }
 
-        st.warning(
-            "🛑 Live fall detection stopped."
-        )
+    if "browser_stream_running" not in st.session_state:
+        st.session_state.browser_stream_running = False
 
+    btn_col1, btn_col2 = st.columns(2)
 
-# ============================================
-# CLOUD / BROWSER MODE
-# ============================================
+    with btn_col1:
+        start_browser = st.button("▶️ Start Browser Detection", use_container_width=True)
+        if start_browser:
+            st.session_state.browser_stream_running = True
+            st.rerun()
 
-else:
+    with btn_col2:
+        stop_browser = st.button("⏹️ Stop Browser Detection", use_container_width=True)
+        if stop_browser:
+            st.session_state.browser_stream_running = False
+            st.rerun()
 
-    if "fall_detection_running" not in st.session_state:
-
-        st.session_state.fall_detection_running = False
-
-
-    if start:
-
-        st.session_state.fall_detection_running = True
-        st.rerun()
-
-
-    if stop:
-
-        st.session_state.fall_detection_running = False
-        st.rerun()
-
-
-    st.markdown("### 🎥 Browser Camera")
-
-
-    webrtc_streamer(
-        key="fall_detection",
-
+    webrtc_ctx = webrtc_streamer(
+        key="fall_detection_adaptive",
         video_processor_factory=web_detector.FallDetectionProcessor,
-
         media_stream_constraints={
-            "video": {
-                "width": {"ideal": 1920},
-                "height": {"ideal": 1080},
-                "frameRate": {"ideal": 30}
-            },
+            "video": video_constraints,
             "audio": False
         },
-
         desired_playing_state=st.session_state.get(
-            "fall_detection_running",
+            "browser_stream_running",
             False
         ),
-
         async_processing=True,
-
         rtc_configuration={
             "iceServers": [
                 {
@@ -327,6 +516,94 @@ else:
             ]
         }
     )
+
+    # Universal Browser Sound Alert & Live Status Panel
+    browser_alarm_panel(webrtc_ctx, get_alarm_audio_b64())
+
+    with st.expander("ℹ️ Camera Permissions & Mobile Browser Connection Guide"):
+        st.markdown("""
+        - **Desktop Browsers (Chrome / Safari / Edge):** Click **Allow** when prompted for camera permission.
+        - **Android Mobile Browsers (Chrome / Firefox):**
+          - Android requires a **Secure Context (HTTPS or localhost)** to access device cameras.
+          - When accessing over local Wi-Fi (e.g. `http://192.168.x.x:8501`), open Chrome on Android, go to `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add your Streamlit URL (`http://<ip>:8501`), and relaunch Chrome.
+          - Alternatively, connect via an HTTPS tunnel (e.g. Cloudflare Tunnel, ngrok, or Streamlit Cloud).
+        - **Front vs Rear Camera:** Use the selector above to switch between selfie mode and room-monitoring mode.
+        - **Camera In Use Error:** If the camera fails to start, ensure no other application (Zoom, FaceTime, Teams) is locking the camera hardware.
+        """)
+
+
+# ============================================
+# PIPELINE 2: LOCAL DESKTOP OPENCV CAMERA
+# ============================================
+
+else:
+
+    st.info("🖥️ **Local Desktop Mode:** Runs direct OpenCV camera capture and native windowing on the host computer.")
+
+    d_col1, d_col2 = st.columns(2)
+    with d_col1:
+        desktop_cam_idx = st.selectbox(
+            "📷 Hardware Camera Index:",
+            [0, 1, 2, 3],
+            index=0,
+            help="Select camera index. 0 is built-in webcam; 1 or 2 for external USB cameras or Continuity Camera."
+        )
+    with d_col2:
+        desktop_res_choice = st.selectbox(
+            "⚙️ Target Desktop Resolution:",
+            ["HD (720p - Recommended)", "Full HD (1080p)", "Standard (480p)"],
+            index=0
+        )
+
+    res_map = {
+        "HD (720p - Recommended)": (1280, 720),
+        "Full HD (1080p)": (1920, 1080),
+        "Standard (480p)": (640, 480)
+    }
+    target_w, target_h = res_map[desktop_res_choice]
+
+    running_pid = get_desktop_detector_pid()
+    if running_pid:
+        st.success(f"🟢 **Detector Process Active** (PID: `{running_pid}`)")
+    else:
+        st.caption("ℹ️ Local desktop detector is currently stopped.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        start_desktop = st.button(
+            "▶️ Launch Desktop Detector",
+            use_container_width=True,
+            disabled=bool(running_pid)
+        )
+
+    with col2:
+        stop_desktop = st.button(
+            "⏹️ Stop Desktop Detector",
+            use_container_width=True,
+            disabled=not bool(running_pid)
+        )
+
+    if start_desktop:
+        cmd = [
+            sys.executable,
+            "10_live_prediction.py",
+            "--camera-index", str(desktop_cam_idx),
+            "--width", str(target_w),
+            "--height", str(target_h)
+        ]
+        proc = subprocess.Popen(cmd)
+        st.session_state.desktop_pid = proc.pid
+        st.success(f"🟢 Launched desktop fall detection (PID: `{proc.pid}`)!")
+        st.rerun()
+
+    if stop_desktop:
+        stopped = stop_desktop_detector()
+        if stopped:
+            st.warning("🛑 Local desktop fall detector and child audio processes stopped cleanly.")
+        else:
+            st.info("Process was not active.")
+        st.rerun()
 
 st.markdown("""
 <style>
